@@ -1,83 +1,188 @@
 import Cardano from "../serialization-lib";
-import { serialize } from "./datums";
-import { BUY } from "./redeemers";
-import { cbor } from "./script";
-import { createTxOutput, finalizeTx, initializeTx } from "../transaction";
-import { getUsedAddresses, getUtxos } from "../wallet";
-import { fromHex, toHex } from "../../utils";
+import { serializeSale } from "./datums";
+import { BUY, CANCEL, UPDATE } from "./redeemers";
+import { contractAddress, contractScripts } from "./validator";
+import {
+  assetsToValue,
+  createTxOutput,
+  createTxUnspentOutput,
+  finalizeTx,
+  initializeTx,
+} from "../transaction";
+import { fromHex, toHex } from "../../utils/converter";
 
-export const offer = async (tn, cs, price) => {
-  await Cardano.load();
-  const { txBuilder, datums, metadata, outputs } = await initializeTx();
+export const listAsset = async (
+  datum,
+  seller: { address: BaseAddress, utxos: [] }
+) => {
+  const { txBuilder, datums, outputs } = initializeTx();
 
-  const walletAddress = Cardano.Instance.BaseAddress.from_address(
-    Cardano.Instance.Address.from_bytes(fromHex((await getUsedAddresses())[0]))
-  );
-
-  const utxos = (await getUtxos()).map((utxo) =>
+  const utxos = seller.utxos.map((utxo) =>
     Cardano.Instance.TransactionUnspentOutput.from_bytes(fromHex(utxo))
   );
 
-  const offerDatum = await serialize({
-    tn,
-    cs,
-    price,
-    sellerAddress: toHex(walletAddress.payment_cred().to_keyhash().to_bytes()),
-  });
+  const lockAssetDatum = serializeSale(datum);
+  datums.add(lockAssetDatum);
 
   outputs.add(
-    await createTxOutput(
-      await contractAddress(),
-      await assetsToValue([
+    createTxOutput(
+      contractAddress(),
+      assetsToValue([
         {
-          unit: cs,
+          unit: `${datum.cs}${datum.tn}`,
           quantity: "1",
         },
+        { unit: "lovelace", quantity: "2000000" },
       ]),
-      {
-        datum: offerDatum,
-        index: 0,
-        tradeOwnerAddress: walletAddress,
-        metadata,
-      }
+      { datum: lockAssetDatum }
     )
   );
-  datums.add(offerDatum);
+
+  const datumHash = toHex(
+    Cardano.Instance.hash_plutus_data(lockAssetDatum).to_bytes()
+  );
 
   const txHash = await finalizeTx({
     txBuilder,
-    changeAddress: walletAddress,
+    datums,
     utxos,
     outputs,
-    datums,
-    metadata,
-    plutusScripts: await contractScripts(),
+    changeAddress: seller.address,
   });
-  return txHash;
+
+  return {
+    datumHash,
+    txHash,
+  };
 };
 
-export const cancel = async () => {};
+export const updateListing = async (
+  currentDatum,
+  newDatum,
+  seller: { address: BaseAddress, utxos: [] },
+  assetUtxo
+) => {
+  const { txBuilder, datums, outputs } = initializeTx();
 
-export const purchase = async (tokenUtxo) => {
-  await Cardano.load();
-  const { txBuilder, datums, outputs } = await initializeTx();
-
-  const walletAddress = Cardano.Instance.BaseAddress.from_address(
-    Cardano.Instance.Address.from_bytes(fromHex((await getUsedAddresses())[0]))
-  );
-
-  const utxos = (await getUtxos()).map((utxo) =>
+  const utxos = seller.utxos.map((utxo) =>
     Cardano.Instance.TransactionUnspentOutput.from_bytes(fromHex(utxo))
   );
 
-  datums.add(tokenUtxo.datum);
+  const currentListingDatum = serializeSale(currentDatum);
+  datums.add(currentListingDatum);
 
-  const token = tokenUtxo.utxo.output().amount();
+  const newListingDatum = serializeSale(newDatum);
+  datums.add(newListingDatum);
 
-  outputs.add(createTxOutput(walletAddress.to_address(), token));
+  outputs.add(
+    createTxOutput(
+      contractAddress(),
+      createTxUnspentOutput(contractAddress(), assetUtxo).output().amount(),
+      { datum: newListingDatum }
+    )
+  );
 
   const requiredSigners = Cardano.Instance.Ed25519KeyHashes.new();
-  requiredSigners.add(walletAddress.payment_cred().to_keyhash());
+  requiredSigners.add(seller.address.payment_cred().to_keyhash());
+  txBuilder.set_required_signers(requiredSigners);
+
+  const datumHash = toHex(
+    Cardano.Instance.hash_plutus_data(newListingDatum).to_bytes()
+  );
+
+  const txHash = await finalizeTx({
+    txBuilder,
+    datums,
+    utxos,
+    outputs,
+    changeAddress: seller.address,
+    scriptUtxo: createTxUnspentOutput(contractAddress(), assetUtxo),
+    plutusScripts: contractScripts(),
+    action: UPDATE,
+  });
+
+  return {
+    datumHash,
+    txHash,
+  };
+};
+
+export const cancelListing = async (
+  datum,
+  seller: { address: BaseAddress, utxos: [] },
+  assetUtxo
+) => {
+  const { txBuilder, datums, outputs } = initializeTx();
+
+  const utxos = seller.utxos.map((utxo) =>
+    Cardano.Instance.TransactionUnspentOutput.from_bytes(fromHex(utxo))
+  );
+
+  const cancelListingDatum = serializeSale(datum);
+  datums.add(cancelListingDatum);
+
+  outputs.add(
+    createTxOutput(
+      seller.address.to_address(),
+      createTxUnspentOutput(contractAddress(), assetUtxo).output().amount()
+    )
+  );
+
+  const requiredSigners = Cardano.Instance.Ed25519KeyHashes.new();
+  requiredSigners.add(seller.address.payment_cred().to_keyhash());
+  txBuilder.set_required_signers(requiredSigners);
+
+  const txHash = await finalizeTx({
+    txBuilder,
+    datums,
+    utxos,
+    outputs,
+    changeAddress: seller.address,
+    scriptUtxo: createTxUnspentOutput(contractAddress(), assetUtxo),
+    plutusScripts: contractScripts(),
+    action: CANCEL,
+  });
+
+  return txHash;
+};
+
+export const purchaseAsset = async (
+  datum,
+  buyer: { address: BaseAddress, utxos: [] },
+  beneficiaries: {
+    seller: BaseAddress,
+    artist: BaseAddress,
+    market: BaseAddress,
+  },
+  assetUtxo
+) => {
+  const { txBuilder, datums, outputs } = initializeTx();
+
+  const utxos = buyer.utxos.map((utxo) =>
+    Cardano.Instance.TransactionUnspentOutput.from_bytes(fromHex(utxo))
+  );
+
+  const purchaseAssetDatum = serializeSale(datum);
+  datums.add(purchaseAssetDatum);
+
+  outputs.add(
+    createTxOutput(
+      buyer.address.to_address(),
+      createTxUnspentOutput(contractAddress(), assetUtxo).output().amount()
+    )
+  );
+
+  splitAmount(
+    beneficiaries,
+    {
+      price: datum.price,
+      royalties: datum.rp,
+    },
+    outputs
+  );
+
+  const requiredSigners = Cardano.Instance.Ed25519KeyHashes.new();
+  requiredSigners.add(buyer.address.payment_cred().to_keyhash());
   txBuilder.set_required_signers(requiredSigners);
 
   const txHash = await finalizeTx({
@@ -85,63 +190,48 @@ export const purchase = async (tokenUtxo) => {
     utxos,
     outputs,
     datums,
-    scriptUtxo: tokenUtxo.utxo,
-    changeAddress: walletAddress,
-    plutusScripts: await contractScripts(),
+    changeAddress: buyer.address,
+    scriptUtxo: createTxUnspentOutput(contractAddress(), assetUtxo),
+    plutusScripts: contractScripts(),
     action: BUY,
   });
 
   return txHash;
 };
 
-export const contractAddress = async () => {
-  await Cardano.load();
+const splitAmount = (
+  { seller, artist, market },
+  { price, royalties },
+  outputs
+) => {
+  const minimumAmount = 1600000;
+  const marketFeePercentage = 2 / 100;
+  const royaltyFeePercentage = royalties / 100;
 
-  return Cardano.Instance.Address.from_bech32(
-    "addr_test1wq2m8ul5twkj8c0mc2nyxgr8ylk2u07rj882hs90a5yrhzgwgatvu"
+  const royaltyFees = Math.max(royaltyFeePercentage * price, minimumAmount);
+  outputs.add(
+    createTxOutput(
+      artist.to_address(),
+      assetsToValue([{ unit: "lovelace", quantity: `${royaltyFees}` }])
+    )
   );
-};
 
-export const contractScripts = async () => {
-  await Cardano.load();
-
-  const scripts = Cardano.Instance.PlutusScripts.new();
-
-  scripts.add(Cardano.Instance.PlutusScript.new(fromHex(cbor)));
-
-  return scripts;
-};
-
-const assetsToValue = async (assets) => {
-  await Cardano.load();
-  const multiAsset = Cardano.Instance.MultiAsset.new();
-  const lovelace = assets.find((asset) => asset.unit === "lovelace");
-  const policies = [
-    ...new Set(
-      assets
-        .filter((asset) => asset.unit !== "lovelace")
-        .map((asset) => asset.unit.slice(0, 56))
-    ),
-  ];
-  policies.forEach((policy) => {
-    const policyAssets = assets.filter(
-      (asset) => asset.unit.slice(0, 56) === policy
-    );
-    const assetsValue = Cardano.Instance.Assets.new();
-    policyAssets.forEach((asset) => {
-      assetsValue.insert(
-        Cardano.Instance.AssetName.new(Buffer.from(asset.unit.slice(56), "hex")),
-        Cardano.Instance.BigNum.from_str(asset.quantity)
-      );
-    });
-    multiAsset.insert(
-      Cardano.Instance.ScriptHash.from_bytes(Buffer.from(policy, "hex")),
-      assetsValue
-    );
-  });
-  const value = Cardano.Instance.Value.new(
-    Cardano.Instance.BigNum.from_str(lovelace ? lovelace.quantity : "0")
+  const marketFees = Math.max(marketFeePercentage * price, minimumAmount);
+  outputs.add(
+    createTxOutput(
+      market.to_address(),
+      assetsToValue([{ unit: "lovelace", quantity: `${marketFees}` }])
+    )
   );
-  if (assets.length > 1 || !lovelace) value.set_multiasset(multiAsset);
-  return value;
+
+  const netPrice =
+    price - royaltyFeePercentage * price - marketFeePercentage * price;
+  outputs.add(
+    createTxOutput(
+      seller.to_address(),
+      assetsToValue([
+        { unit: "lovelace", quantity: `${Math.max(netPrice, minimumAmount)}` },
+      ])
+    )
+  );
 };

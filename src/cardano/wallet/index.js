@@ -1,8 +1,6 @@
 import Cardano from "../serialization-lib";
-import { getTxDetails } from "../blockfrost-api";
-import { getAsset } from "../../database";
-import { getTxUnspentOutputHash } from "../transaction";
-import { fromHex } from "../../utils";
+import { getTxUnspentOutput, valueToAssets } from "../transaction";
+import { fromHex } from "../../utils/converter";
 
 export const getBalance = async () => {
   return await window.cardano.getBalance();
@@ -17,50 +15,31 @@ export const getNetworkId = async () => {
 };
 
 export const getOwnedAssets = async () => {
-  // TODO: refactor using map, filter and reduce.
-  await Cardano.load();
-  let assets = {};
-
-  const usedAddress = Cardano.Instance.Address.from_bytes(
-    fromHex((await getUsedAddresses())[0])
-  ).to_bech32();
-
+  const usedAddress = await getUsedAddress();
   const utxos = await getUtxos();
 
-  for (var u_i in utxos) {
-    let utxo_hex_byte_string = utxos[u_i];
-    let utxo_hash = await getTxUnspentOutputHash(utxo_hex_byte_string);
+  const ownedAssets = utxos
+    .map((utxo) => getTxUnspentOutput(utxo).output())
+    .filter(
+      (txOut) =>
+        txOut.amount().multiasset() !== undefined &&
+        txOut.address().to_bech32() === usedAddress
+    )
+    .map((txOut) => valueToAssets(txOut.amount()))
+    .flatMap((assets) =>
+      assets
+        .filter((asset) => asset.unit !== "lovelace")
+        .map((asset) => asset.unit)
+    );
 
-    let utxo = await getTxDetails(utxo_hash);
-
-    const ownedOutputs = utxo.outputs.filter((o) => {
-      return o.address === usedAddress;
-    });
-
-    for (var o_i in ownedOutputs) {
-      let this_tx_out = ownedOutputs[o_i];
-      for (var a_i in this_tx_out.amount) {
-        let this_unit = this_tx_out.amount[a_i].unit;
-        if (!(this_unit in assets)) assets[this_unit] = { quantity: 0 };
-        assets[this_unit].quantity += parseInt(
-          this_tx_out.amount[a_i].quantity
-        );
-      }
-    }
-  }
-
-  for (var asset_id in assets) {
-    if (asset_id !== "lovelace") {
-      let asset_info = await getAsset(asset_id);
-      assets[asset_id].info = asset_info.info;
-    }
-  }
-
-  return assets;
+  return [...new Set(ownedAssets)];
 };
 
-export const getUsedAddresses = async () => {
-  return await window.cardano.getUsedAddresses();
+export const getUsedAddress = async () => {
+  const usedAddresses = await window.cardano.getUsedAddresses();
+  return Cardano.Instance.Address.from_bytes(
+    fromHex(usedAddresses[0])
+  ).to_bech32();
 };
 
 export const getUtxos = async () => {
